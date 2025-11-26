@@ -1,0 +1,36 @@
+# Rust / Cargo
+target/
+debug/
+**/*.rs.bk
+
+# Если это библиотека, можно игнорировать Cargo.lock,
+# но для приложения обычно его КОММИТЯТ.
+# Раскомментируй строку ниже, если хочешь игнорировать:
+# Cargo.lock
+
+# Логи и временные файлы
+*.log
+*.tmp
+
+# IDE / редакторы
+# VS Code
+.vscode/
+
+# IntelliJ / CLion / RustRover
+.idea/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Дополнительные системные файлы (на всякий случай)
+.Spotlight-V100
+.Trashes
+
+# Бывает в некоторых проектах
+*.swp
+*.swo

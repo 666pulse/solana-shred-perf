@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use clap::Parser;
-use log::{info, error};
+use log::{error, info};
 use solana_ledger::shred::{Shred, ShredId};
-use tokio::net::UdpSocket;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -19,7 +19,7 @@ struct Args {
     pub name_1: String,
     #[clap(short, long)]
     pub port_1: u16,
-    #[clap(long, default_value = "60")]
+    #[clap(long, default_value = "120")]
     pub timeout_secs: u64,
 }
 
@@ -39,7 +39,8 @@ struct ProcessorState {
     port0_data: HashMap<ShredId, Instant>,
     port1_data: HashMap<ShredId, Instant>,
     matched_pairs: usize,
-    delays: Vec<Duration>,
+    delays1: Vec<Duration>,
+    delays2: Vec<Duration>,
 }
 
 #[tokio::main]
@@ -49,8 +50,18 @@ async fn main() -> anyhow::Result<()> {
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
 
-    let port0_task = start_port_listener(0, args.name_0.clone().into(), args.port_0, processor_tx.clone());
-    let port1_task = start_port_listener(1, args.name_1.clone().into(), args.port_1, processor_tx.clone());
+    let port0_task = start_port_listener(
+        0,
+        args.name_0.clone().into(),
+        args.port_0,
+        processor_tx.clone(),
+    );
+    let port1_task = start_port_listener(
+        1,
+        args.name_1.clone().into(),
+        args.port_1,
+        processor_tx.clone(),
+    );
 
     let timer_task = {
         let processor_tx = processor_tx.clone();
@@ -76,12 +87,18 @@ async fn main() -> anyhow::Result<()> {
             port0_data: HashMap::new(),
             port1_data: HashMap::new(),
             matched_pairs: 0,
-            delays: Vec::new(),
+            delays1: Vec::new(),
+            delays2: Vec::new(),
         };
 
         while let Some(event) = processor_rx.recv().await {
             match event {
-                ProcessorEvent::ShredReceived { port_id, name,shred_id, timestamp } => {
+                ProcessorEvent::ShredReceived {
+                    port_id,
+                    name,
+                    shred_id,
+                    timestamp,
+                } => {
                     process_shred(&mut state, port_id, name, shred_id, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
@@ -144,7 +161,13 @@ fn start_port_listener(
     })
 }
 
-fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_id: ShredId, timestamp: Instant) {
+fn process_shred(
+    state: &mut ProcessorState,
+    port_id: u8,
+    name: Arc<str>,
+    shred_id: ShredId,
+    timestamp: Instant,
+) {
     match port_id {
         0 => {
             if state.port0_data.contains_key(&shred_id) {
@@ -154,8 +177,8 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
             if let Some(other_time) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
-                state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                state.delays1.push(delay);
+                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         1 => {
@@ -166,8 +189,8 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
             if let Some(other_time) = state.port0_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
-                state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                state.delays2.push(delay);
+                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         _ => unreachable!(),
@@ -176,25 +199,80 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
 
 fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
     let now = Instant::now();
-    state.port0_data.retain(|_, t| now.duration_since(*t) < timeout);
-    state.port1_data.retain(|_, t| now.duration_since(*t) < timeout);
+    state
+        .port0_data
+        .retain(|_, t| now.duration_since(*t) < timeout);
+    state
+        .port1_data
+        .retain(|_, t| now.duration_since(*t) < timeout);
     info!("Cleanup completed");
 }
 
 fn report_stats(state: &ProcessorState, args: &Args) {
-    let avg_delay = if !state.delays.is_empty() {
-        state.delays.iter().sum::<Duration>() / state.delays.len() as u32
+    let (avg_delay1, delay_count1) = if !state.delays1.is_empty() {
+        (
+            state.delays1.iter().sum::<Duration>() / state.delays1.len() as u32,
+            state.delays1.len(),
+        )
     } else {
-        Duration::ZERO
+        (Duration::ZERO, 0)
+    };
+    let win_percent_1 = if state.matched_pairs != 0 {
+        ((delay_count1 as f64 / state.matched_pairs as f64) * 100.)
+    } else {
+        0.
+    };
+
+    let (avg_delay2, delay_count2) = if !state.delays2.is_empty() {
+        (
+            state.delays2.iter().sum::<Duration>() / state.delays2.len() as u32,
+            state.delays2.len(),
+        )
+    } else {
+        (Duration::ZERO, 0)
+    };
+
+    let win_percent_2 = if state.matched_pairs != 0 {
+        ((delay_count2 as f64 / state.matched_pairs as f64) * 100.)
+    } else {
+        0.
     };
 
     info!(
-        "Stats: Port {}: {} | Port {}: {} | Matched: {} | Avg delay: {:?}",
+        "Stats: Port {}: {} | Port {}: {} | Matched: {} | {} loses in {:.2}% with median delay : {:?} AND {} loses in {:.2}% with median delay: {:?}",
         args.name_0,
         state.port0_data.len(),
         args.name_1,
         state.port1_data.len(),
         state.matched_pairs,
-        avg_delay
+        args.name_0,
+        win_percent_1,
+        median_duration(&state.delays1),
+        args.name_1,
+        win_percent_2,
+        median_duration(&state.delays2),
     );
+}
+
+fn median_duration(data: &[Duration]) -> Duration {
+    let len = data.len();
+    if len == 0 {
+        return Duration::ZERO;
+    }
+
+    let mut v = data.to_vec();
+
+    v.sort_by_key(|d| d.as_nanos());
+
+    let mid = len / 2;
+
+    if len % 2 == 1 {
+        v[mid]
+    } else {
+        let a = v[mid - 1].as_nanos();
+        let b = v[mid].as_nanos();
+        let avg = (a + b) / 2;
+
+        Duration::from_nanos(avg as u64)
+    }
 }

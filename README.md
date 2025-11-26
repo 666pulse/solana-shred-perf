@@ -1,6 +1,6 @@
 # solana-shred-perf
 
-Sample code to test and compare performance between any two Shreds.
+A benchmark to compare performance between two shred sources. It shows the win rate and, most importantly, the median latencies for each source when they lose. This gives a clear understanding of whether a particular shred source can provide an advantage.
 
 # How to use?
 
@@ -22,9 +22,11 @@ Where:
 
 For example:
 ```bash
-export RUST_LOG=info && cargo run -- --name-0 uk --port-0 20001 --name-1 de --port-1 20002
+export RUST_LOG=info && cargo run -- --name-0 Shreder --port-0 20001 --name-1 Source2 --port-1 20002
 ```
 
-This compares a shred named `uk` with a data receiving port of `20001` to a shred named `de` with a data receiving port of `20002`. Normal execution outputs data as follows:
+This compares a shred named `Shreder` with a data receiving port of `20001` to a shred named `Source2` with a data receiving port of `20002`. 
 
-<img width="656" height="111" alt="image" src="https://github.com/user-attachments/assets/501e8ccf-caef-4a3d-af6d-ecf766d08a0a" />
+```bash
+Port Shreder: 141997 | Port Source2: 141995 | Matched: 141991 | Shreder loses in 18.03466416885578% with median delay : 96.732µs AND Source2 loses in 81.96533583114423% with median delay: 1.650741ms
+```
