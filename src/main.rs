@@ -40,8 +40,6 @@ enum ProcessorEvent {
     },
     Cleanup,
     StatsTick,
-    SaveStats,
-    Shutdown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -142,8 +140,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let output_file = args.output_file.clone();
-    let processor_tx_for_save = processor_tx.clone();
     let max_slots = args.max_slots;
+    let processor_tx_clone = processor_tx.clone();
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
             port0_data: HashMap::new(),
@@ -156,7 +154,6 @@ async fn main() -> anyhow::Result<()> {
             seen_slots: std::collections::HashSet::new(),
         };
 
-        let mut should_shutdown = false;
         while let Some(event) = processor_rx.recv().await {
             match event {
                 ProcessorEvent::ShredReceived {
@@ -169,16 +166,17 @@ async fn main() -> anyhow::Result<()> {
                     let new_slot = state.seen_slots.insert(slot);
                     if new_slot {
                         if max_slots > 0 && state.seen_slots.len() >= max_slots as usize {
-                            info!("Reached max slots limit ({}), shutting down...", max_slots);
-                            should_shutdown = true;
+                            info!("Reached max slots limit ({}), saving statistics...", max_slots);
                             // 保存数据
                             if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
                                 error!("Failed to save stats to JSON: {}", e);
                             } else {
                                 info!("Statistics saved to {}", output_file);
                             }
-                            // 关闭 channel 以停止监听器
+                            // 关闭 channel，让监听器自然退出
                             drop(processor_rx);
+                            drop(processor_tx_clone);
+                            // 退出循环，processor_task 完成
                             break;
                         }
                     }
@@ -193,32 +191,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     report_stats(&state, &args);
                 }
-                ProcessorEvent::SaveStats => {
-                    if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
-                        error!("Failed to save stats to JSON: {}", e);
-                    } else {
-                        info!("Statistics saved to {}", output_file);
-                    }
-                }
-                ProcessorEvent::Shutdown => {
-                    info!("Shutting down processor...");
-                    // 保存数据
-                    if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
-                        error!("Failed to save stats to JSON: {}", e);
-                    } else {
-                        info!("Statistics saved to {}", output_file);
-                    }
-                    break;
-                }
-            }
-        }
-
-        // 在退出前再次保存统计数据（双重保险）
-        if !should_shutdown {
-            if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
-                error!("Failed to save stats to JSON: {}", e);
-            } else {
-                info!("Statistics saved to {}", output_file);
             }
         }
     });
@@ -229,15 +201,13 @@ async fn main() -> anyhow::Result<()> {
         result = processor_task => {
             if let Err(e) = result {
                 error!("Processor task error: {:?}", e);
+            } else {
+                info!("Program completed successfully");
             }
         },
         _ = timer_task => {},
         _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down...");
-            // 发送关闭信号
-            processor_tx_for_save.send(ProcessorEvent::Shutdown).await.ok();
-            // 等待一小段时间确保 processor_task 处理完 Shutdown 事件并保存数据
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            info!("Interrupted by user, exiting...");
         },
     }
 
@@ -276,9 +246,9 @@ fn start_port_listener(
                             slot,
                             timestamp: Instant::now(),
                         };
-                        if let Err(e) = sender.send(event).await {
-                            error!("[{}] Failed to send event: {}", name, e);
-                            break; // 如果 channel 关闭，退出循环
+                        if let Err(_) = sender.send(event).await {
+                            // Channel 已关闭，正常退出
+                            break;
                         }
                     }
                 }
