@@ -1,7 +1,9 @@
 use clap::Parser;
 use log::{error, info};
+use serde::{Deserialize, Serialize};
 use solana_ledger::shred::{Shred, ShredId};
 use std::collections::HashMap;
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -21,6 +23,8 @@ struct Args {
     pub port_1: u16,
     #[clap(long, default_value = "120")]
     pub timeout_secs: u64,
+    #[clap(long)]
+    pub output_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -33,6 +37,47 @@ enum ProcessorEvent {
     },
     Cleanup,
     StatsTick,
+    SaveStats,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Percentiles {
+    p50: f64,
+    p90: f64,
+    p99: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct EndpointSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_shred_delay: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    processing_delay: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation_delay: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finalization_delay: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_time: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_time: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation_time: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finalization_time: Option<Percentiles>,
+    account_delay: Option<Percentiles>, // 总是序列化，即使为 None（会序列化为 null）
+    // 添加我们自己的统计字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lead_time: Option<Percentiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_time: Option<Percentiles>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct StatsData {
+    endpoint1_summary: EndpointSummary,
+    endpoint2_summary: EndpointSummary,
+    slots: Vec<serde_json::Value>,
 }
 
 struct ProcessorState {
@@ -90,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    let output_file = args.output_file.clone();
+    let processor_tx_for_save = processor_tx.clone();
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
             port0_data: HashMap::new(),
@@ -117,6 +164,24 @@ async fn main() -> anyhow::Result<()> {
                 ProcessorEvent::StatsTick => {
                     report_stats(&state, &args);
                 }
+                ProcessorEvent::SaveStats => {
+                    if let Some(output_file) = &output_file {
+                        if let Err(e) = save_stats_to_json(&state, &args, output_file) {
+                            error!("Failed to save stats to JSON: {}", e);
+                        } else {
+                            info!("Statistics saved to {}", output_file);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 在退出前保存统计数据
+        if let Some(output_file) = &output_file {
+            if let Err(e) = save_stats_to_json(&state, &args, output_file) {
+                error!("Failed to save stats to JSON: {}", e);
+            } else {
+                info!("Statistics saved to {}", output_file);
             }
         }
     });
@@ -126,7 +191,13 @@ async fn main() -> anyhow::Result<()> {
         _ = port1_task => {},
         _ = processor_task => {},
         _ = timer_task => {},
-        _ = tokio::signal::ctrl_c() => info!("Shutting down..."),
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutting down...");
+            // 发送保存统计数据的请求
+            processor_tx_for_save.send(ProcessorEvent::SaveStats).await.ok();
+            // 等待一小段时间确保保存完成
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        },
     }
 
     Ok(())
@@ -339,4 +410,69 @@ fn format_nanos(nanos: i64) -> String {
     } else {
         format!("{}{}ns", sign, nanos)
     }
+}
+
+fn calculate_percentiles_f64(data: &[i64]) -> Option<Percentiles> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut sorted: Vec<f64> = data.iter().map(|&x| x as f64 / 1_000_000.0).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let len = sorted.len();
+    let p50_idx = ((len - 1) as f64 * 0.5).round() as usize;
+    let p90_idx = ((len - 1) as f64 * 0.9).round() as usize;
+    let p99_idx = ((len - 1) as f64 * 0.99).round() as usize;
+
+    Some(Percentiles {
+        p50: sorted[p50_idx.min(len - 1)],
+        p90: sorted[p90_idx.min(len - 1)],
+        p99: sorted[p99_idx.min(len - 1)],
+    })
+}
+
+fn save_stats_to_json(
+    state: &ProcessorState,
+    args: &Args,
+    output_file: &str,
+) -> anyhow::Result<()> {
+    let endpoint1_summary = EndpointSummary {
+        first_shred_delay: None,
+        processing_delay: None,
+        confirmation_delay: None,
+        finalization_delay: None,
+        download_time: None,
+        replay_time: None,
+        confirmation_time: None,
+        finalization_time: None,
+        account_delay: None,
+        lead_time: calculate_percentiles_f64(&state.lead_times_ns),
+        diff_time: calculate_percentiles_f64(&state.all_diffs_ns),
+    };
+
+    let endpoint2_summary = EndpointSummary {
+        first_shred_delay: None,
+        processing_delay: None,
+        confirmation_delay: None,
+        finalization_delay: None,
+        download_time: None,
+        replay_time: None,
+        confirmation_time: None,
+        finalization_time: None,
+        account_delay: None,
+        lead_time: None,
+        diff_time: None,
+    };
+
+    let stats_data = StatsData {
+        endpoint1_summary,
+        endpoint2_summary,
+        slots: Vec::new(),
+    };
+
+    let json = serde_json::to_string_pretty(&stats_data)?;
+    fs::write(output_file, json)?;
+
+    Ok(())
 }
