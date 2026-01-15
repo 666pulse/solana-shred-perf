@@ -39,8 +39,13 @@ struct ProcessorState {
     port0_data: HashMap<ShredId, Instant>,
     port1_data: HashMap<ShredId, Instant>,
     matched_pairs: usize,
-    delays1: Vec<Duration>,
-    delays2: Vec<Duration>,
+    // First seen 统计
+    first_seen_port0: usize, // port0 先看到的 shred 数量
+    first_seen_port1: usize, // port1 先看到的 shred 数量
+    // Lead time: 当 port0 先到达时的延迟（port1_time - port0_time，正数，单位：纳秒）
+    lead_times_ns: Vec<i64>,
+    // Diff time: 所有匹配的延迟（port0_time - port1_time，可能是负数，单位：纳秒）
+    all_diffs_ns: Vec<i64>,
 }
 
 #[tokio::main]
@@ -90,8 +95,10 @@ async fn main() -> anyhow::Result<()> {
             port0_data: HashMap::new(),
             port1_data: HashMap::new(),
             matched_pairs: 0,
-            delays1: Vec::new(),
-            delays2: Vec::new(),
+            first_seen_port0: 0,
+            first_seen_port1: 0,
+            lead_times_ns: Vec::new(),
+            all_diffs_ns: Vec::new(),
         };
 
         while let Some(event) = processor_rx.recv().await {
@@ -176,24 +183,52 @@ fn process_shred(
             if state.port0_data.contains_key(&shred_id) {
                 return;
             }
+            let is_first_seen = !state.port1_data.contains_key(&shred_id);
+            if is_first_seen {
+                state.first_seen_port0 += 1;
+            }
             state.port0_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port1_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
+            if let Some(port1_time) = state.port1_data.get(&shred_id) {
                 state.matched_pairs += 1;
-                state.delays1.push(delay);
-                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                // all_diffs: port0_time - port1_time (纳秒，可以是负数)
+                let diff_ns = if timestamp >= *port1_time {
+                    timestamp.duration_since(*port1_time).as_nanos() as i64
+                } else {
+                    -(port1_time.duration_since(timestamp).as_nanos() as i64)
+                };
+                state.all_diffs_ns.push(diff_ns);
+
+                // lead_times: 当 port0 先到达时，port0 领先的时间 = port1_time - port0_time（正数）
+                if is_first_seen && timestamp < *port1_time {
+                    let lead_time_ns = port1_time.duration_since(timestamp).as_nanos() as i64;
+                    state.lead_times_ns.push(lead_time_ns);
+                }
             }
         }
         1 => {
             if state.port1_data.contains_key(&shred_id) {
                 return;
             }
+            let is_first_seen = !state.port0_data.contains_key(&shred_id);
+            if is_first_seen {
+                state.first_seen_port1 += 1;
+            }
             state.port1_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port0_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
+            if let Some(port0_time) = state.port0_data.get(&shred_id) {
                 state.matched_pairs += 1;
-                state.delays2.push(delay);
-                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                // all_diffs: port0_time - port1_time (纳秒，可以是负数)
+                let diff_ns = if *port0_time >= timestamp {
+                    port0_time.duration_since(timestamp).as_nanos() as i64
+                } else {
+                    -(timestamp.duration_since(*port0_time).as_nanos() as i64)
+                };
+                state.all_diffs_ns.push(diff_ns);
+
+                // lead_times: 当 port0 先到达时，port0 领先的时间 = port1_time - port0_time（正数）
+                if !is_first_seen && *port0_time < timestamp {
+                    let lead_time_ns = timestamp.duration_since(*port0_time).as_nanos() as i64;
+                    state.lead_times_ns.push(lead_time_ns);
+                }
             }
         }
         _ => unreachable!(),
@@ -212,70 +247,94 @@ fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
 }
 
 fn report_stats(state: &ProcessorState, args: &Args) {
-    let (avg_delay1, delay_count1) = if !state.delays1.is_empty() {
-        (
-            state.delays1.iter().sum::<Duration>() / state.delays1.len() as u32,
-            state.delays1.len(),
-        )
+    let total_first_seen = state.first_seen_port0 + state.first_seen_port1;
+    let port0_percent = if total_first_seen > 0 {
+        (state.first_seen_port0 as f64 / total_first_seen as f64) * 100.0
     } else {
-        (Duration::ZERO, 0)
+        0.0
     };
-    let win_percent_1 = if state.matched_pairs != 0 {
-        ((delay_count1 as f64 / state.matched_pairs as f64) * 100.)
+    let port1_percent = if total_first_seen > 0 {
+        (state.first_seen_port1 as f64 / total_first_seen as f64) * 100.0
     } else {
-        0.
+        0.0
     };
 
-    let (avg_delay2, delay_count2) = if !state.delays2.is_empty() {
-        (
-            state.delays2.iter().sum::<Duration>() / state.delays2.len() as u32,
-            state.delays2.len(),
-        )
-    } else {
-        (Duration::ZERO, 0)
-    };
+    info!("First seen shred in 1min: {{From:{}, Nums:{}, Percent:{:.1}%}}, {{From:others, Nums:0, Percent:0.0%}}, {{From:{}, Nums:{}, Percent:{:.1}%}}",
+        args.name_0, state.first_seen_port0, port0_percent,
+        args.name_1, state.first_seen_port1, port1_percent);
 
-    let win_percent_2 = if state.matched_pairs != 0 {
-        ((delay_count2 as f64 / state.matched_pairs as f64) * 100.)
-    } else {
-        0.
-    };
-
-    info!(
-        "Stats: Port {}: {} | Port {}: {} | Matched: {} | {} loses in {:.2}% with median delay : {:?} AND {} loses in {:.2}% with median delay: {:?}",
-        args.name_0,
-        state.port0_data.len(),
-        args.name_1,
-        state.port1_data.len(),
-        state.matched_pairs,
-        args.name_0,
-        win_percent_1,
-        median_duration(&state.delays1),
-        args.name_1,
-        win_percent_2,
-        median_duration(&state.delays2),
-    );
-}
-
-fn median_duration(data: &[Duration]) -> Duration {
-    let len = data.len();
-    if len == 0 {
-        return Duration::ZERO;
+    // Target-led shred lead time
+    if !state.lead_times_ns.is_empty() {
+        let percentiles = calculate_percentiles_i64(&state.lead_times_ns);
+        info!(
+            "{}-led shred lead time (n={}) against {}: P1={}, P5={}, P10={}, P25={}, P50={}, P75={}, P80={}, P90={}, P95={}, P99={}",
+            args.name_0,
+            state.lead_times_ns.len(),
+            args.name_1,
+            format_nanos(percentiles[0]),
+            format_nanos(percentiles[1]),
+            format_nanos(percentiles[2]),
+            format_nanos(percentiles[3]),
+            format_nanos(percentiles[4]),
+            format_nanos(percentiles[5]),
+            format_nanos(percentiles[6]),
+            format_nanos(percentiles[7]),
+            format_nanos(percentiles[8]),
+            format_nanos(percentiles[9]),
+        );
     }
 
-    let mut v = data.to_vec();
+    // Target-diff shred diff time
+    if !state.all_diffs_ns.is_empty() {
+        let percentiles = calculate_percentiles_i64(&state.all_diffs_ns);
+        info!(
+            "{}-diff shred diff time (n={}) against {}: P1={}, P5={}, P10={}, P25={}, P50={}, P75={}, P80={}, P90={}, P95={}, P99={}",
+            args.name_0,
+            state.all_diffs_ns.len(),
+            args.name_1,
+            format_nanos(percentiles[0]),
+            format_nanos(percentiles[1]),
+            format_nanos(percentiles[2]),
+            format_nanos(percentiles[3]),
+            format_nanos(percentiles[4]),
+            format_nanos(percentiles[5]),
+            format_nanos(percentiles[6]),
+            format_nanos(percentiles[7]),
+            format_nanos(percentiles[8]),
+            format_nanos(percentiles[9]),
+        );
+    }
+}
 
-    v.sort_by_key(|d| d.as_nanos());
+fn calculate_percentiles_i64(data: &[i64]) -> [i64; 10] {
+    if data.is_empty() {
+        return [0; 10];
+    }
 
-    let mid = len / 2;
+    let mut sorted = data.to_vec();
+    sorted.sort();
 
-    if len % 2 == 1 {
-        v[mid]
+    let len = sorted.len();
+    let percentiles = [1, 5, 10, 25, 50, 75, 80, 90, 95, 99];
+
+    let mut result = [0; 10];
+    for (i, &p) in percentiles.iter().enumerate() {
+        let index = ((len - 1) as f64 * p as f64 / 100.0).round() as usize;
+        result[i] = sorted[index.min(len - 1)];
+    }
+
+    result
+}
+
+fn format_nanos(nanos: i64) -> String {
+    let abs_nanos = nanos.abs() as f64;
+    let sign = if nanos < 0 { "-" } else { "" };
+
+    if abs_nanos >= 1_000_000.0 {
+        format!("{}{:.6}ms", sign, abs_nanos / 1_000_000.0)
+    } else if abs_nanos >= 1_000.0 {
+        format!("{}{:.3}µs", sign, abs_nanos / 1_000.0)
     } else {
-        let a = v[mid - 1].as_nanos();
-        let b = v[mid].as_nanos();
-        let avg = (a + b) / 2;
-
-        Duration::from_nanos(avg as u64)
+        format!("{}{}ns", sign, nanos)
     }
 }
