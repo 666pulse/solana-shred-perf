@@ -226,14 +226,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = port0_task => {},
         _ = port1_task => {},
-        _ = processor_task => {},
+        result = processor_task => {
+            if let Err(e) = result {
+                error!("Processor task error: {:?}", e);
+            }
+        },
         _ = timer_task => {},
         _ = tokio::signal::ctrl_c() => {
             info!("Shutting down...");
             // 发送关闭信号
             processor_tx_for_save.send(ProcessorEvent::Shutdown).await.ok();
-            // 等待 processor_task 完成
-            processor_task.await.ok();
+            // 等待一小段时间确保 processor_task 处理完 Shutdown 事件并保存数据
+            tokio::time::sleep(Duration::from_millis(500)).await;
         },
     }
 
