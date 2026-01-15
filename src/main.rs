@@ -45,7 +45,10 @@ struct ProcessorState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    pretty_env_logger::init();
+    // 默认设置为 info 级别，无需设置 RUST_LOG 环境变量
+    pretty_env_logger::formatted_timed_builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
     let args = Args::parse();
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
