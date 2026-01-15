@@ -75,11 +75,36 @@ struct EndpointSummary {
     diff_time: Option<Percentiles>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SlotEndpointData {
+    first_shred_delay_ms: f64,
+    processing_delay_ms: f64,
+    confirmation_delay_ms: f64,
+    finalization_delay_ms: f64,
+    transitions: Vec<serde_json::Value>,
+    durations: serde_json::Value,
+    account_updates: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SlotData {
+    slot: u64,
+    endpoint1: SlotEndpointData,
+    endpoint2: SlotEndpointData,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct StatsData {
     endpoint1_summary: EndpointSummary,
     endpoint2_summary: EndpointSummary,
-    slots: Vec<serde_json::Value>,
+    slots: Vec<SlotData>,
+}
+
+struct SlotInfo {
+    port0_first_shred_time: Option<Instant>,
+    port1_first_shred_time: Option<Instant>,
+    port0_shreds: Vec<(ShredId, Instant)>,
+    port1_shreds: Vec<(ShredId, Instant)>,
 }
 
 struct ProcessorState {
@@ -95,6 +120,8 @@ struct ProcessorState {
     all_diffs_ns: Vec<i64>,
     // Slot 统计
     seen_slots: std::collections::HashSet<u64>,
+    // Slot 详细信息
+    slot_data: std::collections::HashMap<u64, SlotInfo>,
 }
 
 #[tokio::main]
@@ -152,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             lead_times_ns: Vec::new(),
             all_diffs_ns: Vec::new(),
             seen_slots: std::collections::HashSet::new(),
+            slot_data: std::collections::HashMap::new(),
         };
 
         while let Some(event) = processor_rx.recv().await {
@@ -180,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
                             break;
                         }
                     }
-                    process_shred(&mut state, port_id, name, shred_id, timestamp);
+                    process_shred(&mut state, port_id, name, shred_id, slot, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
@@ -263,8 +291,32 @@ fn process_shred(
     port_id: u8,
     name: Arc<str>,
     shred_id: ShredId,
+    slot: u64,
     timestamp: Instant,
 ) {
+    // 更新 slot 信息
+    let slot_info = state.slot_data.entry(slot).or_insert_with(|| SlotInfo {
+        port0_first_shred_time: None,
+        port1_first_shred_time: None,
+        port0_shreds: Vec::new(),
+        port1_shreds: Vec::new(),
+    });
+
+    match port_id {
+        0 => {
+            if slot_info.port0_first_shred_time.is_none() {
+                slot_info.port0_first_shred_time = Some(timestamp);
+            }
+            slot_info.port0_shreds.push((shred_id.clone(), timestamp));
+        }
+        1 => {
+            if slot_info.port1_first_shred_time.is_none() {
+                slot_info.port1_first_shred_time = Some(timestamp);
+            }
+            slot_info.port1_shreds.push((shred_id.clone(), timestamp));
+        }
+        _ => {}
+    }
     match port_id {
         0 => {
             if state.port0_data.contains_key(&shred_id) {
@@ -481,10 +533,115 @@ fn save_stats_to_json(
         diff_time: None,
     };
 
+    // 构建 slots 数据
+    let mut slots = Vec::new();
+    let mut sorted_slots: Vec<_> = state.slot_data.iter().collect();
+    sorted_slots.sort_by_key(|(slot, _)| **slot);
+
+    for (slot, slot_info) in sorted_slots {
+        // 计算延迟（相对于第一个端点的延迟）
+        let first_time = slot_info.port0_first_shred_time
+            .or(slot_info.port1_first_shred_time)
+            .unwrap_or_else(|| Instant::now());
+
+        // first_shred_delay: 如果这个端点先收到，延迟为 0；否则是相对于另一个端点的延迟
+        let endpoint1_first_shred_delay = match (slot_info.port0_first_shred_time, slot_info.port1_first_shred_time) {
+            (Some(t0), Some(t1)) => {
+                if t0 <= t1 {
+                    0.0  // endpoint1 先收到
+                } else {
+                    t0.duration_since(t1).as_secs_f64() * 1000.0  // endpoint1 延迟
+                }
+            }
+            (Some(_), None) => 0.0,  // 只有 endpoint1 收到
+            (None, Some(t1)) => {
+                // endpoint1 没收到，但 endpoint2 收到了，延迟很大
+                Instant::now().duration_since(t1).as_secs_f64() * 1000.0
+            }
+            (None, None) => 0.0,
+        };
+
+        let endpoint2_first_shred_delay = match (slot_info.port0_first_shred_time, slot_info.port1_first_shred_time) {
+            (Some(t0), Some(t1)) => {
+                if t1 <= t0 {
+                    0.0  // endpoint2 先收到
+                } else {
+                    t1.duration_since(t0).as_secs_f64() * 1000.0  // endpoint2 延迟
+                }
+            }
+            (None, Some(_)) => 0.0,  // 只有 endpoint2 收到
+            (Some(t0), None) => {
+                // endpoint2 没收到，但 endpoint1 收到了，延迟很大
+                Instant::now().duration_since(t0).as_secs_f64() * 1000.0
+            }
+            (None, None) => 0.0,
+        };
+
+        // 计算 processing_delay（这里简化处理，使用第一个和最后一个 shred 的时间差）
+        let endpoint1_processing_delay = if let (Some(t0), Some(t1)) = (
+            slot_info.port0_first_shred_time,
+            slot_info.port0_shreds.last().map(|(_, t)| *t),
+        ) {
+            if let Some(last) = slot_info.port0_shreds.last() {
+                last.1.duration_since(t0).as_secs_f64() * 1000.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let endpoint2_processing_delay = if let (Some(t1), _) = (
+            slot_info.port1_first_shred_time,
+            slot_info.port1_shreds.last().map(|(_, t)| *t),
+        ) {
+            if let Some(last) = slot_info.port1_shreds.last() {
+                last.1.duration_since(t1).as_secs_f64() * 1000.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let slot_data = SlotData {
+            slot: *slot,
+            endpoint1: SlotEndpointData {
+                first_shred_delay_ms: endpoint1_first_shred_delay,
+                processing_delay_ms: endpoint1_processing_delay,
+                confirmation_delay_ms: 0.0,
+                finalization_delay_ms: 0.0,
+                transitions: Vec::new(),
+                durations: serde_json::json!({
+                    "download_ms": 0.0,
+                    "replay_ms": 0.0,
+                    "confirmation_ms": 0.0,
+                    "finalization_ms": 0.0
+                }),
+                account_updates: Vec::new(),
+            },
+            endpoint2: SlotEndpointData {
+                first_shred_delay_ms: endpoint2_first_shred_delay,
+                processing_delay_ms: endpoint2_processing_delay,
+                confirmation_delay_ms: 0.0,
+                finalization_delay_ms: 0.0,
+                transitions: Vec::new(),
+                durations: serde_json::json!({
+                    "download_ms": 0.0,
+                    "replay_ms": 0.0,
+                    "confirmation_ms": 0.0,
+                    "finalization_ms": 0.0
+                }),
+                account_updates: Vec::new(),
+            },
+        };
+        slots.push(slot_data);
+    }
+
     let stats_data = StatsData {
         endpoint1_summary,
         endpoint2_summary,
-        slots: Vec::new(),
+        slots,
     };
 
     let json = serde_json::to_string_pretty(&stats_data)?;
