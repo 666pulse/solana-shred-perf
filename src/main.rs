@@ -23,8 +23,8 @@ struct Args {
     pub port_1: u16,
     #[clap(long, default_value = "120")]
     pub timeout_secs: u64,
-    #[clap(long)]
-    pub output_file: Option<String>,
+    #[clap(long, default_value = "stats.json")]
+    pub output_file: String,
 }
 
 #[derive(Debug)]
@@ -165,24 +165,20 @@ async fn main() -> anyhow::Result<()> {
                     report_stats(&state, &args);
                 }
                 ProcessorEvent::SaveStats => {
-                    if let Some(output_file) = &output_file {
-                        if let Err(e) = save_stats_to_json(&state, &args, output_file) {
-                            error!("Failed to save stats to JSON: {}", e);
-                        } else {
-                            info!("Statistics saved to {}", output_file);
-                        }
+                    if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
+                        error!("Failed to save stats to JSON: {}", e);
+                    } else {
+                        info!("Statistics saved to {}", output_file);
                     }
                 }
             }
         }
 
         // 在退出前保存统计数据
-        if let Some(output_file) = &output_file {
-            if let Err(e) = save_stats_to_json(&state, &args, output_file) {
-                error!("Failed to save stats to JSON: {}", e);
-            } else {
-                info!("Statistics saved to {}", output_file);
-            }
+        if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
+            error!("Failed to save stats to JSON: {}", e);
+        } else {
+            info!("Statistics saved to {}", output_file);
         }
     });
 
@@ -194,9 +190,11 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Shutting down...");
             // 发送保存统计数据的请求
+            let output_file = args.output_file.clone();
             processor_tx_for_save.send(ProcessorEvent::SaveStats).await.ok();
             // 等待一小段时间确保保存完成
             tokio::time::sleep(Duration::from_millis(100)).await;
+            info!("Statistics saved to {}", output_file);
         },
     }
 
