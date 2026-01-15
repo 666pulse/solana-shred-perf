@@ -259,7 +259,9 @@ fn report_stats(state: &ProcessorState, args: &Args) {
         0.0
     };
 
-    info!("First seen shred in 1min: {{From:{}, Nums:{}, Percent:{:.1}%}}, {{From:others, Nums:0, Percent:0.0%}}, {{From:{}, Nums:{}, Percent:{:.1}%}}",
+    info!("First seen shred in 1min");
+    info!("");
+    info!("{{From:{}, Nums:{}, Percent:{:.1}%}}, {{From:others, Nums:0, Percent:0.0%}}, {{From:{}, Nums:{}, Percent:{:.1}%}}",
         args.name_0, state.first_seen_port0, port0_percent,
         args.name_1, state.first_seen_port1, port1_percent);
 
