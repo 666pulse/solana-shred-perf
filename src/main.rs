@@ -79,10 +79,6 @@ struct EndpointSummary {
 struct SlotEndpointData {
     first_shred_delay_ms: f64,
     processing_delay_ms: f64,
-    confirmation_delay_ms: f64,
-    finalization_delay_ms: f64,
-    transitions: Vec<serde_json::Value>,
-    durations: serde_json::Value,
     account_updates: Vec<serde_json::Value>,
 }
 
@@ -194,7 +190,10 @@ async fn main() -> anyhow::Result<()> {
                     let new_slot = state.seen_slots.insert(slot);
                     if new_slot {
                         if max_slots > 0 && state.seen_slots.len() >= max_slots as usize {
-                            info!("Reached max slots limit ({}), saving statistics...", max_slots);
+                            info!(
+                                "Reached max slots limit ({}), saving statistics...",
+                                max_slots
+                            );
                             // 保存数据
                             if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
                                 error!("Failed to save stats to JSON: {}", e);
@@ -540,20 +539,24 @@ fn save_stats_to_json(
 
     for (slot, slot_info) in sorted_slots {
         // 计算延迟（相对于第一个端点的延迟）
-        let first_time = slot_info.port0_first_shred_time
+        let first_time = slot_info
+            .port0_first_shred_time
             .or(slot_info.port1_first_shred_time)
             .unwrap_or_else(|| Instant::now());
 
         // first_shred_delay: 如果这个端点先收到，延迟为 0；否则是相对于另一个端点的延迟
-        let endpoint1_first_shred_delay = match (slot_info.port0_first_shred_time, slot_info.port1_first_shred_time) {
+        let endpoint1_first_shred_delay = match (
+            slot_info.port0_first_shred_time,
+            slot_info.port1_first_shred_time,
+        ) {
             (Some(t0), Some(t1)) => {
                 if t0 <= t1 {
-                    0.0  // endpoint1 先收到
+                    0.0 // endpoint1 先收到
                 } else {
-                    t0.duration_since(t1).as_secs_f64() * 1000.0  // endpoint1 延迟
+                    t0.duration_since(t1).as_secs_f64() * 1000.0 // endpoint1 延迟
                 }
             }
-            (Some(_), None) => 0.0,  // 只有 endpoint1 收到
+            (Some(_), None) => 0.0, // 只有 endpoint1 收到
             (None, Some(t1)) => {
                 // endpoint1 没收到，但 endpoint2 收到了，延迟很大
                 Instant::now().duration_since(t1).as_secs_f64() * 1000.0
@@ -561,15 +564,18 @@ fn save_stats_to_json(
             (None, None) => 0.0,
         };
 
-        let endpoint2_first_shred_delay = match (slot_info.port0_first_shred_time, slot_info.port1_first_shred_time) {
+        let endpoint2_first_shred_delay = match (
+            slot_info.port0_first_shred_time,
+            slot_info.port1_first_shred_time,
+        ) {
             (Some(t0), Some(t1)) => {
                 if t1 <= t0 {
-                    0.0  // endpoint2 先收到
+                    0.0 // endpoint2 先收到
                 } else {
-                    t1.duration_since(t0).as_secs_f64() * 1000.0  // endpoint2 延迟
+                    t1.duration_since(t0).as_secs_f64() * 1000.0 // endpoint2 延迟
                 }
             }
-            (None, Some(_)) => 0.0,  // 只有 endpoint2 收到
+            (None, Some(_)) => 0.0, // 只有 endpoint2 收到
             (Some(t0), None) => {
                 // endpoint2 没收到，但 endpoint1 收到了，延迟很大
                 Instant::now().duration_since(t0).as_secs_f64() * 1000.0
@@ -609,29 +615,11 @@ fn save_stats_to_json(
             endpoint1: SlotEndpointData {
                 first_shred_delay_ms: endpoint1_first_shred_delay,
                 processing_delay_ms: endpoint1_processing_delay,
-                confirmation_delay_ms: 0.0,
-                finalization_delay_ms: 0.0,
-                transitions: Vec::new(),
-                durations: serde_json::json!({
-                    "download_ms": 0.0,
-                    "replay_ms": 0.0,
-                    "confirmation_ms": 0.0,
-                    "finalization_ms": 0.0
-                }),
                 account_updates: Vec::new(),
             },
             endpoint2: SlotEndpointData {
                 first_shred_delay_ms: endpoint2_first_shred_delay,
                 processing_delay_ms: endpoint2_processing_delay,
-                confirmation_delay_ms: 0.0,
-                finalization_delay_ms: 0.0,
-                transitions: Vec::new(),
-                durations: serde_json::json!({
-                    "download_ms": 0.0,
-                    "replay_ms": 0.0,
-                    "confirmation_ms": 0.0,
-                    "finalization_ms": 0.0
-                }),
                 account_updates: Vec::new(),
             },
         };
