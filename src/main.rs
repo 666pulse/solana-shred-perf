@@ -25,6 +25,8 @@ struct Args {
     pub timeout_secs: u64,
     #[clap(long, default_value = "stats.json")]
     pub output_file: String,
+    #[clap(long, default_value_t = 1000)]
+    pub max_slots: u64,
 }
 
 #[derive(Debug)]
@@ -33,11 +35,13 @@ enum ProcessorEvent {
         port_id: u8,
         name: Arc<str>,
         shred_id: ShredId,
+        slot: u64,
         timestamp: Instant,
     },
     Cleanup,
     StatsTick,
     SaveStats,
+    Shutdown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -91,6 +95,8 @@ struct ProcessorState {
     lead_times_ns: Vec<i64>,
     // Diff time: 所有匹配的延迟（port0_time - port1_time，可能是负数，单位：纳秒）
     all_diffs_ns: Vec<i64>,
+    // Slot 统计
+    seen_slots: std::collections::HashSet<u64>,
 }
 
 #[tokio::main]
@@ -137,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
 
     let output_file = args.output_file.clone();
     let processor_tx_for_save = processor_tx.clone();
+    let max_slots = args.max_slots;
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
             port0_data: HashMap::new(),
@@ -146,22 +153,44 @@ async fn main() -> anyhow::Result<()> {
             first_seen_port1: 0,
             lead_times_ns: Vec::new(),
             all_diffs_ns: Vec::new(),
+            seen_slots: std::collections::HashSet::new(),
         };
 
+        let mut should_shutdown = false;
         while let Some(event) = processor_rx.recv().await {
             match event {
                 ProcessorEvent::ShredReceived {
                     port_id,
                     name,
                     shred_id,
+                    slot,
                     timestamp,
                 } => {
+                    let new_slot = state.seen_slots.insert(slot);
+                    if new_slot {
+                        if max_slots > 0 && state.seen_slots.len() >= max_slots as usize {
+                            info!("Reached max slots limit ({}), shutting down...", max_slots);
+                            should_shutdown = true;
+                            // 保存数据
+                            if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
+                                error!("Failed to save stats to JSON: {}", e);
+                            } else {
+                                info!("Statistics saved to {}", output_file);
+                            }
+                            // 关闭 channel 以停止监听器
+                            drop(processor_rx);
+                            break;
+                        }
+                    }
                     process_shred(&mut state, port_id, name, shred_id, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
+                    if max_slots > 0 {
+                        info!("Processed {} / {} slots", state.seen_slots.len(), max_slots);
+                    }
                     report_stats(&state, &args);
                 }
                 ProcessorEvent::SaveStats => {
@@ -171,14 +200,26 @@ async fn main() -> anyhow::Result<()> {
                         info!("Statistics saved to {}", output_file);
                     }
                 }
+                ProcessorEvent::Shutdown => {
+                    info!("Shutting down processor...");
+                    // 保存数据
+                    if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
+                        error!("Failed to save stats to JSON: {}", e);
+                    } else {
+                        info!("Statistics saved to {}", output_file);
+                    }
+                    break;
+                }
             }
         }
 
-        // 在退出前保存统计数据
-        if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
-            error!("Failed to save stats to JSON: {}", e);
-        } else {
-            info!("Statistics saved to {}", output_file);
+        // 在退出前再次保存统计数据（双重保险）
+        if !should_shutdown {
+            if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
+                error!("Failed to save stats to JSON: {}", e);
+            } else {
+                info!("Statistics saved to {}", output_file);
+            }
         }
     });
 
@@ -189,12 +230,10 @@ async fn main() -> anyhow::Result<()> {
         _ = timer_task => {},
         _ = tokio::signal::ctrl_c() => {
             info!("Shutting down...");
-            // 发送保存统计数据的请求
-            let output_file = args.output_file.clone();
-            processor_tx_for_save.send(ProcessorEvent::SaveStats).await.ok();
-            // 等待一小段时间确保保存完成
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            info!("Statistics saved to {}", output_file);
+            // 发送关闭信号
+            processor_tx_for_save.send(ProcessorEvent::Shutdown).await.ok();
+            // 等待 processor_task 完成
+            processor_task.await.ok();
         },
     }
 
@@ -223,14 +262,19 @@ fn start_port_listener(
                 Ok((size, _)) => {
                     let data = buf[..size].to_vec();
                     if let Ok(shred) = Shred::new_from_serialized_shred(data) {
+                        let shred_id = shred.id();
+                        // 从 shred 中获取 slot
+                        let slot = shred.slot();
                         let event = ProcessorEvent::ShredReceived {
                             port_id,
                             name: Arc::clone(&name),
-                            shred_id: shred.id(),
+                            shred_id,
+                            slot,
                             timestamp: Instant::now(),
                         };
                         if let Err(e) = sender.send(event).await {
                             error!("[{}] Failed to send event: {}", name, e);
+                            break; // 如果 channel 关闭，退出循环
                         }
                     }
                 }
