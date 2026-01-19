@@ -266,6 +266,9 @@ fn start_port_listener(
                         let shred_id = shred.id();
                         // 从 shred 中获取 slot
                         let slot = shred.slot();
+
+                        let version = shred.version();
+                        info!("[{}] Shred version: {}, slot: {}, index: {}", name, version, slot, shred_id.index);
                         let event = ProcessorEvent::ShredReceived {
                             port_id,
                             name: Arc::clone(&name),
