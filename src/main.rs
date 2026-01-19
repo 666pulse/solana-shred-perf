@@ -258,6 +258,7 @@ fn start_port_listener(
         info!("[{}] Listening on port {}", name, port);
 
         let mut buf = [0u8; 2048];
+        let mut has_printed_version = false;
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((size, _)) => {
@@ -267,8 +268,12 @@ fn start_port_listener(
                         // 从 shred 中获取 slot
                         let slot = shred.slot();
 
-                        let version = shred.version();
-                        info!("[{}] Shred version: {}, slot: {}, index: {}", name, version, slot, shred_id.index);
+                        // 只在第一次收到 shred 时打印 version（用于确认连接）
+                        if !has_printed_version {
+                            let version = shred.version();
+                            info!("[{}] Shred version: {}, slot: {}, index: {}", name, version, slot, shred_id.index());
+                            has_printed_version = true;
+                        }
                         let event = ProcessorEvent::ShredReceived {
                             port_id,
                             name: Arc::clone(&name),
