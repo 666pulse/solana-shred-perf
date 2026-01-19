@@ -51,6 +51,7 @@ struct Percentiles {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct EndpointSummary {
+    title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_shred_delay: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -527,6 +528,7 @@ fn save_stats_to_json(
     output_file: &str,
 ) -> anyhow::Result<()> {
     let endpoint1_summary = EndpointSummary {
+        title: args.name_0.clone(),
         first_shred_delay: None,
         processing_delay: None,
         confirmation_delay: None,
@@ -540,6 +542,7 @@ fn save_stats_to_json(
     };
 
     let endpoint2_summary = EndpointSummary {
+        title: args.name_1.clone(),
         first_shred_delay: None,
         processing_delay: None,
         confirmation_delay: None,
