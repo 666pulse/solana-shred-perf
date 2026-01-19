@@ -67,7 +67,6 @@ struct EndpointSummary {
     confirmation_time: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
     finalization_time: Option<Percentiles>,
-    account_delay: Option<Percentiles>, // 总是序列化，即使为 None（会序列化为 null）
     // 添加我们自己的统计字段
     #[serde(skip_serializing_if = "Option::is_none")]
     lead_time: Option<Percentiles>,
@@ -79,7 +78,6 @@ struct EndpointSummary {
 struct SlotEndpointData {
     first_shred_delay_ms: f64,
     processing_delay_ms: f64,
-    account_updates: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -198,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                             if let Err(e) = save_stats_to_json(&state, &args, &output_file) {
                                 error!("Failed to save stats to JSON: {}", e);
                             } else {
-                                info!("Statistics saved to {}", output_file);
+                                info!(">>> Statistics saved to {} <<<", output_file);
                             }
                             // 关闭 channel，让监听器自然退出
                             drop(processor_rx);
@@ -214,7 +212,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 ProcessorEvent::StatsTick => {
                     if max_slots > 0 {
-                        info!("Processed {} / {} slots", state.seen_slots.len(), max_slots);
+                        info!(
+                            ">>> Processed {} / {} slots <<<",
+                            state.seen_slots.len(),
+                            max_slots
+                        );
                     }
                     report_stats(&state, &args);
                 }
@@ -271,7 +273,13 @@ fn start_port_listener(
                         // 只在第一次收到 shred 时打印 version（用于确认连接）
                         if !has_printed_version {
                             let version = shred.version();
-                            info!("[{}] Shred version: {}, slot: {}, index: {}", name, version, slot, shred_id.index());
+                            info!(
+                                "[{}] Shred version: {}, slot: {}, index: {}",
+                                name,
+                                version,
+                                slot,
+                                shred_id.index()
+                            );
                             has_printed_version = true;
                         }
                         let event = ProcessorEvent::ShredReceived {
@@ -405,11 +413,17 @@ fn report_stats(state: &ProcessorState, args: &Args) {
         0.0
     };
 
-    info!("First seen shred in 1min");
+    info!("First seen shred in {}s", args.timeout_secs);
     info!("");
-    info!("{{From:{}, Nums:{}, Percent:{:.1}%}}, {{From:others, Nums:0, Percent:0.0%}}, {{From:{}, Nums:{}, Percent:{:.1}%}}",
-        args.name_0, state.first_seen_port0, port0_percent,
-        args.name_1, state.first_seen_port1, port1_percent);
+    info!(
+        "{{From:{}, Nums:{}, Percent:{:.1}%}}, {{From:{}, Nums:{}, Percent:{:.1}%}}",
+        args.name_0,
+        state.first_seen_port0,
+        port0_percent,
+        args.name_1,
+        state.first_seen_port1,
+        port1_percent
+    );
 
     // Target-led shred lead time
     if !state.lead_times_ns.is_empty() {
@@ -521,7 +535,6 @@ fn save_stats_to_json(
         replay_time: None,
         confirmation_time: None,
         finalization_time: None,
-        account_delay: None,
         lead_time: calculate_percentiles_f64(&state.lead_times_ns),
         diff_time: calculate_percentiles_f64(&state.all_diffs_ns),
     };
@@ -535,7 +548,6 @@ fn save_stats_to_json(
         replay_time: None,
         confirmation_time: None,
         finalization_time: None,
-        account_delay: None,
         lead_time: None,
         diff_time: None,
     };
@@ -623,12 +635,10 @@ fn save_stats_to_json(
             endpoint1: SlotEndpointData {
                 first_shred_delay_ms: endpoint1_first_shred_delay,
                 processing_delay_ms: endpoint1_processing_delay,
-                account_updates: Vec::new(),
             },
             endpoint2: SlotEndpointData {
                 first_shred_delay_ms: endpoint2_first_shred_delay,
                 processing_delay_ms: endpoint2_processing_delay,
-                account_updates: Vec::new(),
             },
         };
         slots.push(slot_data);
