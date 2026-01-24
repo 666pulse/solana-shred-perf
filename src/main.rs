@@ -2,8 +2,10 @@ use clap::Parser;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use solana_ledger::shred::{Shred, ShredId};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -251,14 +253,42 @@ fn start_port_listener(
     sender: mpsc::Sender<ProcessorEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", port)).await {
+        // 使用 socket2 创建 socket 并设置 SO_REUSEPORT
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .expect("Invalid address");
+
+        let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
             Ok(s) => s,
             Err(e) => {
-                error!("[{}] Failed to bind port {}: {}", name, port, e);
+                error!("[{}] Failed to create socket: {}", name, e);
                 return;
             }
         };
-        info!("[{}] Listening on port {}", name, port);
+
+        // 设置 SO_REUSEPORT 选项
+        if let Err(e) = socket.set_reuse_port(true) {
+            error!("[{}] Failed to set SO_REUSEPORT: {}", name, e);
+            return;
+        }
+
+        // 绑定地址
+        if let Err(e) = socket.bind(&addr.into()) {
+            error!("[{}] Failed to bind port {}: {}", name, port, e);
+            return;
+        }
+
+        // 转换为 std::net::UdpSocket，然后转换为 tokio::net::UdpSocket
+        let std_socket: std::net::UdpSocket = socket.into();
+        let socket = match UdpSocket::from_std(std_socket) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("[{}] Failed to create tokio socket: {}", name, e);
+                return;
+            }
+        };
+
+        info!("[{}] Listening on port {} with SO_REUSEPORT", name, port);
 
         let mut buf = [0u8; 2048];
         let mut has_printed_version = false;
